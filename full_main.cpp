@@ -108,7 +108,7 @@ static Mat loadRawRedLike(const string& path) {
     Mat out(h/2, w/2, CV_32FC1);
     float* dst = out.ptr<float>(0);
 
-    #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
     for (int y=0; y<h; y+=2) {
         const int oy = y/2;
         float* row_o = dst + oy*(w/2);
@@ -178,7 +178,7 @@ static bool loadRad(const string& dir, RadCalib& C) {
 // Safe divide (avoid global EPS add)
 static void safeDivide(const Mat& num, const Mat& den, Mat& out) {
     out.create(num.size(), CV_32FC1);
-    #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
     for (int y=0; y<num.rows; ++y) {
         const float* pn = num.ptr<float>(y);
         const float* pd = den.ptr<float>(y);
@@ -204,9 +204,9 @@ static bool estimateH_half(const string& rgbPath, const string& nirPath, Mat& H_
     if (!(okL && okR)) return false;
 
     cornerSubPix(gL, cL, Size(11,11), Size(-1,-1),
-        TermCriteria(TermCriteria::EPS+TermCriteria::MAX_ITER, 30, 0.001));
+                 TermCriteria(TermCriteria::EPS+TermCriteria::MAX_ITER, 30, 0.001));
     cornerSubPix(gR, cR, Size(11,11), Size(-1,-1),
-        TermCriteria(TermCriteria::EPS+TermCriteria::MAX_ITER, 30, 0.001));
+                 TermCriteria(TermCriteria::EPS+TermCriteria::MAX_ITER, 30, 0.001));
 
     Mat Hs = findHomography(cR, cL, RANSAC, 3.0);
     if (Hs.empty()) return false;
@@ -248,7 +248,7 @@ static bool loadH(const string& dir, Mat& H_half) {
 // ---------- NDVI ----------
 static inline void ndviParallel(const Mat& NIR, const Mat& RED, Mat& NDVI) {
     NDVI.create(NIR.size(), CV_32FC1);
-    #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
     for (int y=0; y<NIR.rows; ++y) {
         const float* pn = NIR.ptr<float>(y);
         const float* pr = RED.ptr<float>(y);
@@ -329,46 +329,55 @@ static int mode_capture(const string& rgb_path, const string& nir_path, const st
     Mat H_half;
     if (!loadH(dir, H_half)) { cerr << "load H failed\n"; return 3; }
 
-    // Load RAW planes
-    Mat R_raw = loadRawRedLike(rgb_path);
-    Mat N_raw = loadRawRedLike(nir_path);
-    if (R_raw.size() != C.B_red.size() || N_raw.size() != C.B_nir.size()) { cerr << "size mismatch to calib\n"; return 4; }
+    // Load RAW planes (Red-like for RGB and NOIR+RedFilter)
+    Mat R_raw = loadRawRedLike(rgb_path);   // RGB camera Red channel
+    Mat M_raw = loadRawRedLike(nir_path);   // NOIR camera with Red filter (Red + NIR mix)
+    if (R_raw.size() != C.B_red.size() || M_raw.size() != C.B_nir.size()) { cerr << "size mismatch to calib\n"; return 4; }
 
-    // Dark subtract on sensor grids
-    Mat RmB, NmB;
+    // Dark subtract
+    Mat RmB, MmB;
     subtract(R_raw, C.B_red, RmB);
-    subtract(N_raw, C.B_nir, NmB);
+    subtract(M_raw, C.B_nir, MmB);
 
-    // Warp NIR-side (NmB and WmB_nir) to RED grid using H_half
-    Mat Nmb_aligned, WmB_nir_aligned;
-    warpPerspective(NmB,       Nmb_aligned,      H_half, RmB.size(), INTER_LINEAR, BORDER_REPLICATE);
-    warpPerspective(C.WmB_nir, WmB_nir_aligned,  H_half, RmB.size(), INTER_LINEAR, BORDER_REPLICATE);
+    // Align NOIR+Red to RGB grid
+    Mat Mmb_aligned, WmB_nir_aligned;
+    warpPerspective(MmB,       Mmb_aligned,     H_half, RmB.size(), INTER_LINEAR, BORDER_REPLICATE);
+    warpPerspective(C.WmB_nir, WmB_nir_aligned, H_half, RmB.size(), INTER_LINEAR, BORDER_REPLICATE);
 
-    // Exposure normalization (to white reference exposure), with aperture
-    const ShotMeta cur_red = readShotMeta(rgb_path);
-    const ShotMeta cur_nir = readShotMeta(nir_path);
-    const double s_red = exposureScaleRobust(C.ref_red, cur_red);
-    const double s_nir = exposureScaleRobust(C.ref_nir, cur_nir);
+    // Exposure normalization
+    const ShotMeta cur_red  = readShotMeta(rgb_path);
+    const ShotMeta cur_mixed = readShotMeta(nir_path);
+    const double s_red   = exposureScaleRobust(C.ref_red, cur_red);
+    const double s_mixed = exposureScaleRobust(C.ref_nir, cur_mixed);
 
-    // Reflectance on the same grid: (I-B)/(W-B) * Rw * s
-    Mat R_reflect, N_reflect;
+    // Convert to reflectance
+    Mat R_reflect, M_reflect;
     safeDivide(RmB,        C.WmB_red,       R_reflect);
-    safeDivide(Nmb_aligned,WmB_nir_aligned, N_reflect);
+    safeDivide(Mmb_aligned,WmB_nir_aligned, M_reflect);
     R_reflect *= (C.Rw * s_red);
-    N_reflect *= (C.Rw * s_nir);
+    M_reflect *= (C.Rw * s_mixed);
 
-    // Clamp negatives to zero
+    // Clamp negatives
     threshold(R_reflect, R_reflect, 0.f, 0.f, THRESH_TOZERO);
-    threshold(N_reflect, N_reflect, 0.f, 0.f, THRESH_TOZERO);
+    threshold(M_reflect, M_reflect, 0.f, 0.f, THRESH_TOZERO);
+
+    // ---- New: Extract NIR from Mixed (Red + NIR) ----
+    // Coefficients from calibration (must be measured using white/grey/vegetation targets)
+    const double alpha = 0.65; // proportion of Red leakage into mixed
+    const double beta  = 1.00; // NIR scaling factor
+
+    Mat NIR_reflect;
+    NIR_reflect = (M_reflect - alpha * R_reflect) / (beta + 1e-6);
+    threshold(NIR_reflect, NIR_reflect, 0.f, 0.f, THRESH_TOZERO);
 
     // NDVI
     Mat NDVI;
-    ndviParallel(N_reflect, R_reflect, NDVI);
+    ndviParallel(NIR_reflect, R_reflect, NDVI);
 
     // Save
-    const string outPNG = outPNG_opt.empty() ? ("NDVI_"+tsFromName(rgb_path)+".png") : outPNG_opt;
+    const string outPNG = outPNG_opt.empty() ? ("NDVI_" + tsFromName(rgb_path) + ".png") : outPNG_opt;
     Mat u8, colored;
-    NDVI.convertTo(u8, CV_8UC1, 127.5, 127.5);
+    NDVI.convertTo(u8, CV_8UC1, 127.5, 127.5); // map [-1,1] to [0,255]
     applyColorMap(u8, colored, COLORMAP_JET);
     vector<int> p = {IMWRITE_PNG_COMPRESSION, 1};
     imwrite(outPNG, colored, p);
