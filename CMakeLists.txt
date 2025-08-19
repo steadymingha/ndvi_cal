@@ -6,8 +6,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBRAW REQUIRED libraw)
 
 # add_executable(ndvi main.cpp)
-add_executable(ndvi full_main.cpp
-        newmain.cpp)
+add_executable(ndvi main.cpp)
 
 
 target_include_directories(ndvi PRIVATE

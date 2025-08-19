@@ -1,33 +1,130 @@
-// ndvi_fast.cpp
-// Build: g++ ndvi_fast.cpp -O3 -march=native -fopenmp -o ndvi_fast `pkg-config --cflags --libs opencv4 libraw`
-// Run (calibrate once):   ./ndvi_fast --calib /path/TS_RGB.dng /path/TS_NOIR.dng
-// Run (fast runtime):     ./ndvi_fast --run   /path/TS_RGB.dng /path/TS_NOIR.dng
-// Note: Comments in English only.
+// ndvi_pipeline.cpp
+// Build:
+//   g++ ndvi_pipeline.cpp -O3 -march=native -fopenmp -o ndvi_pipeline `pkg-config --cflags --libs opencv4 libraw`
+// Usage:
+//   ./ndvi_pipeline dark    <RGB_dark.dng> <NOIR_dark.dng>                   <out_dir>
+//   ./ndvi_pipeline white   <RGB_white.dng> <NOIR_white.dng>                 <out_dir> <Rw>
+//   ./ndvi_pipeline calib   <RGB_chess.dng> <NOIR_chess.dng>                 <out_dir>
+//   ./ndvi_pipeline capture <RGB.dng>      <NOIR.dng>                        <dir_with_calib> [out.png]
+//
+// Notes:
+// - CFA assumed BGGR (Blue,Green / Green,Red). Red site = (x+1, y+1).
+// - Radiometry: dark/white based, exposure-normalized with ISO, shutter, aperture (f-number).
+// - Homography saved as H_half (RAW half-res grid). No scaling in capture.
+// - Comments: English only.
 
 #include <opencv2/opencv.hpp>
 #include <libraw/libraw.h>
 #include <iostream>
-#include <regex>
 #include <filesystem>
+#include <regex>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 using namespace std;
 using namespace cv;
+namespace fs = std::filesystem;
 
-enum class Channel { RED, NIR };
+// ---------- Config ----------
+static const Size  CB_SIZE = Size(7,10);   // inner corners
+static const double EPS = 1e-6;
+static const double DOWNSCALE = 0.35;     // chessboard detection scale
 
-static const Size CHESSBOARD_SIZE = Size(7, 10); // inner corners
-static const double EPS = 1e-5;
-static const string H_PATH = "homography.yml"; // cached H
+enum class Channel { RED };
 
-// Extract timestamp from "YYYYMMDDHHMMSS_RGB.dng"
-static string extractTS(const string& path) {
+// ---------- Utilities ----------
+static bool ensureDir(const string& dir) {
+    std::error_code ec; fs::create_directories(dir, ec); return !ec;
+}
+static string tsFromName(const string& path) {
     smatch m; regex re(R"((\d{14})_(RGB|NOIR)\.dng$)");
     if (regex_search(path, m, re)) return m[1];
     return "OUT";
 }
 
-// Load small BGR for chessboard (fast demosaic)
-static Mat loadBGRforCorners(const string& path, double scale=0.25) {
+// ---------- Shot metadata (EXIF-like) ----------
+struct ShotMeta {
+    double iso = 0.0;         // ISO speed
+    double shutter_s = 0.0;   // seconds
+    double aperture = 0.0;    // f-number
+};
+
+static ShotMeta readShotMeta(const string& dngPath) {
+    ShotMeta sm;
+    LibRaw raw;
+    if (raw.open_file(dngPath.c_str()) == LIBRAW_SUCCESS) {
+        raw.unpack();
+        sm.iso       = raw.imgdata.other.iso_speed;
+        sm.shutter_s = raw.imgdata.other.shutter;   // seconds
+        sm.aperture  = raw.imgdata.other.aperture;  // f-number
+        raw.recycle();
+    }
+    return sm;
+}
+
+static inline double safeISO(const ShotMeta& m)     { return (m.iso       > 0) ? m.iso       : 100.0; }
+static inline double safeT(const ShotMeta& m)       { return (m.shutter_s > 0) ? m.shutter_s : 0.01; }
+static inline double safeF(const ShotMeta& m)       { return (m.aperture  > 0) ? m.aperture  : 2.8; }
+
+// Exposure scale with aperture: E ∝ (t * ISO) / f^2
+static double exposureScaleRobust(const ShotMeta& ref, const ShotMeta& cur) {
+    const double E_ref = (safeT(ref) * safeISO(ref)) / (safeF(ref)*safeF(ref));
+    const double E_cur = (safeT(cur) * safeISO(cur)) / (safeF(cur)*safeF(cur));
+    return (E_ref > 0) ? (E_ref / std::max(EPS, E_cur)) : 1.0;
+}
+
+// ---------- LibRaw helpers ----------
+static int getBlack(LibRaw& raw) {
+    int black = raw.imgdata.color.black;
+    if (black <= 0) {
+        int sum=0, cnt=0;
+        for (int i=0;i<8;++i) { int v = raw.imgdata.color.cblack[i]; if (v>0){ sum+=v; cnt++; } }
+        if (cnt>0) black = sum/cnt;
+    }
+    return std::max(0, black);
+}
+
+static pair<int,int> rawHalfSize(const string& dng) {
+    LibRaw r; r.open_file(dng.c_str()); r.unpack();
+    int w = r.imgdata.sizes.raw_width;
+    int h = r.imgdata.sizes.raw_height;
+    r.recycle();
+    return {w/2, h/2};
+}
+
+// Load RAW half-res plane from BGGR red sites (x+1,y+1)
+static Mat loadRawRedLike(const string& path) {
+    LibRaw raw;
+    if (raw.open_file(path.c_str()) != LIBRAW_SUCCESS) throw runtime_error("open failed: "+path);
+    if (raw.unpack() != LIBRAW_SUCCESS)               throw runtime_error("unpack failed: "+path);
+
+    ushort* bayer = raw.imgdata.rawdata.raw_image;
+    const int h = raw.imgdata.sizes.raw_height;
+    const int w = raw.imgdata.sizes.raw_width;
+    const int stride = raw.imgdata.sizes.raw_pitch/2;
+    const int black = getBlack(raw);
+
+    Mat out(h/2, w/2, CV_32FC1);
+    float* dst = out.ptr<float>(0);
+
+#pragma omp parallel for schedule(static)
+    for (int y=0; y<h; y+=2) {
+        const int oy = y/2;
+        float* row_o = dst + oy*(w/2);
+        for (int x=0; x<w; x+=2) {
+            const int ix = x+1, iy = y+1;         // red site for BGGR
+            const int idx = iy*stride + ix;
+            const int dn  = std::max(0, int(bayer[idx]) - black);
+            row_o[x/2] = float(dn);
+        }
+    }
+    raw.recycle();
+    return out;
+}
+
+// Demosaic to BGR for chessboard corner detection (only in calib)
+static Mat loadBGRforCorners(const string& path, double scale=DOWNSCALE) {
     LibRaw raw;
     if (raw.open_file(path.c_str()) != LIBRAW_SUCCESS) return Mat();
     if (raw.unpack() != LIBRAW_SUCCESS) return Mat();
@@ -35,77 +132,75 @@ static Mat loadBGRforCorners(const string& path, double scale=0.25) {
     raw.imgdata.params.use_camera_wb  = 1;
     if (raw.dcraw_process() != LIBRAW_SUCCESS) return Mat();
     libraw_processed_image_t* pim = raw.dcraw_make_mem_image();
-    if (!pim || pim->colors != 3 || pim->bits != 8) {
-        if (pim) LibRaw::dcraw_clear_mem(pim);
-        raw.recycle(); return Mat();
-    }
+    if (!pim || pim->colors!=3 || pim->bits!=8) { if (pim) LibRaw::dcraw_clear_mem(pim); raw.recycle(); return Mat(); }
     Mat rgb(pim->height, pim->width, CV_8UC3, pim->data);
     Mat bgr; cvtColor(rgb, bgr, COLOR_RGB2BGR);
-    Mat bgrClone = bgr.clone();
+    Mat out = bgr.clone();
     LibRaw::dcraw_clear_mem(pim);
     raw.recycle();
-    if (scale != 1.0) {
-        Mat small; resize(bgrClone, small, Size(), scale, scale, INTER_AREA);
-        return small;
-    }
-    return bgrClone;
-}
-
-// Get global/per-channel black level (LibRaw-robust)
-static int getBlackLevel(LibRaw& raw) {
-    int black = raw.imgdata.color.black;
-    if (black <= 0) {
-        int sum = 0, cnt = 0;
-        for (int i = 0; i < 8; ++i) {
-            int v = raw.imgdata.color.cblack[i];
-            if (v > 0) { sum += v; cnt++; }
-        }
-        if (cnt > 0) black = sum / cnt;
-    }
-    return max(0, black);
-}
-
-// Load RAW half-res plane from Bayer (assume RGGB; R:(0,0), NIR uses (1,1))
-static Mat loadRawChannel(const string& path, Channel ch) {
-    LibRaw raw;
-    if (raw.open_file(path.c_str()) != LIBRAW_SUCCESS) throw runtime_error("open failed: " + path);
-    if (raw.unpack() != LIBRAW_SUCCESS) throw runtime_error("unpack failed: " + path);
-
-    ushort* bayer = raw.imgdata.rawdata.raw_image;
-    int h = raw.imgdata.sizes.raw_height;
-    int w = raw.imgdata.sizes.raw_width;
-    int pitch16 = raw.imgdata.sizes.raw_pitch / 2;
-    int black = getBlackLevel(raw);
-
-    Mat out(h/2, w/2, CV_32FC1);
-    float* dst = out.ptr<float>(0);
-
-    // OpenMP parallel loop for speed
-    #pragma omp parallel for
-    for (int y = 0; y < h; y += 2) {
-        int oy = y/2;
-        for (int x = 0; x < w; x += 2) {
-            int ix = (ch == Channel::RED) ? x   : x+1;
-            int iy = (ch == Channel::RED) ? y   : y+1;
-            int idx = iy * pitch16 + ix;
-            float val = float(max(0, int(bayer[idx]) - black));
-            dst[oy * (w/2) + (x/2)] = val;
-        }
-    }
-    raw.recycle();
+    if (scale!=1.0) { Mat small; resize(out, small, Size(), scale, scale, INTER_AREA); return small; }
     return out;
 }
 
-// Estimate H at downscale between NOIR and RGB (NOIR -> RGB)
-static bool estimateH(const string& rgbPath, const string& noirPath, Mat& H_full, double scale=0.25) {
-    Mat rgb_s = loadBGRforCorners(rgbPath, scale);
-    Mat nir_s = loadBGRforCorners(noirPath, scale);
+// ---------- Radiometric calibration ----------
+struct RadCalib {
+    Mat B_red,  B_nir;     // dark frames (half-res, float)
+    Mat WmB_red, WmB_nir;  // (white - dark) (half-res, float)
+    double Rw = 1.0;       // panel reflectance
+    ShotMeta ref_red, ref_nir; // exposure of white frames
+};
+
+static bool saveRad(const string& dir, const RadCalib& C) {
+    FileStorage fs(dir + "/radiometric.yml", FileStorage::WRITE);
+    if (!fs.isOpened()) return false;
+    fs << "Rw" << C.Rw;
+    fs << "B_red" << C.B_red;
+    fs << "B_nir" << C.B_nir;
+    fs << "WmB_red" << C.WmB_red;
+    fs << "WmB_nir" << C.WmB_nir;
+    fs << "ref_iso_red" << C.ref_red.iso << "ref_t_red" << C.ref_red.shutter_s << "ref_f_red" << C.ref_red.aperture;
+    fs << "ref_iso_nir" << C.ref_nir.iso << "ref_t_nir" << C.ref_nir.shutter_s << "ref_f_nir" << C.ref_nir.aperture;
+    return true;
+}
+static bool loadRad(const string& dir, RadCalib& C) {
+    FileStorage fs(dir + "/radiometric.yml", FileStorage::READ);
+    if (!fs.isOpened()) return false;
+    fs["Rw"] >> C.Rw;
+    fs["B_red"] >> C.B_red;
+    fs["B_nir"] >> C.B_nir;
+    fs["WmB_red"] >> C.WmB_red;
+    fs["WmB_nir"] >> C.WmB_nir;
+    fs["ref_iso_red"] >> C.ref_red.iso;   fs["ref_t_red"] >> C.ref_red.shutter_s; fs["ref_f_red"] >> C.ref_red.aperture;
+    fs["ref_iso_nir"] >> C.ref_nir.iso;   fs["ref_t_nir"] >> C.ref_nir.shutter_s; fs["ref_f_nir"] >> C.ref_nir.aperture;
+    return true;
+}
+
+// Safe divide (avoid global EPS add)
+static void safeDivide(const Mat& num, const Mat& den, Mat& out) {
+    out.create(num.size(), CV_32FC1);
+#pragma omp parallel for schedule(static)
+    for (int y=0; y<num.rows; ++y) {
+        const float* pn = num.ptr<float>(y);
+        const float* pd = den.ptr<float>(y);
+        float* po = out.ptr<float>(y);
+        for (int x=0; x<num.cols; ++x) {
+            const float d = pd[x];
+            po[x] = (d > 0.f) ? (pn[x] / d) : 0.f;
+        }
+    }
+}
+
+// ---------- Homography (store as H_half) ----------
+static bool estimateH_half(const string& rgbPath, const string& nirPath, Mat& H_half) {
+    // 1) H at downscaled demosaiced resolution
+    Mat rgb_s  = loadBGRforCorners(rgbPath, DOWNSCALE);
+    Mat nir_s  = loadBGRforCorners(nirPath, DOWNSCALE);
     if (rgb_s.empty() || nir_s.empty()) return false;
 
     Mat gL, gR; cvtColor(rgb_s, gL, COLOR_BGR2GRAY); cvtColor(nir_s, gR, COLOR_BGR2GRAY);
     vector<Point2f> cL, cR;
-    bool okL = findChessboardCorners(gL, CHESSBOARD_SIZE, cL);
-    bool okR = findChessboardCorners(gR, CHESSBOARD_SIZE, cR);
+    bool okL = findChessboardCorners(gL, CB_SIZE, cL);
+    bool okR = findChessboardCorners(gR, CB_SIZE, cR);
     if (!(okL && okR)) return false;
 
     cornerSubPix(gL, cL, Size(11,11), Size(-1,-1),
@@ -113,115 +208,238 @@ static bool estimateH(const string& rgbPath, const string& noirPath, Mat& H_full
     cornerSubPix(gR, cR, Size(11,11), Size(-1,-1),
                  TermCriteria(TermCriteria::EPS+TermCriteria::MAX_ITER, 30, 0.001));
 
-    // H at "scale" resolution
     Mat Hs = findHomography(cR, cL, RANSAC, 3.0);
     if (Hs.empty()) return false;
 
-    // Lift H to full demosaiced resolution
-    double sx = 1.0/scale, sy = 1.0/scale;
-    Mat S  = (Mat_<double>(3,3) << sx,0,0, 0,sy,0, 0,0,1);
-    Mat S_inv = (Mat_<double>(3,3) << 1.0/sx,0,0, 0,1.0/sy,0, 0,0,1);
-    H_full = S * Hs * S_inv;
+    // 2) Lift to full demosaiced size
+    // Obtain full demosaic dims once (calibration time only)
+    LibRaw tmp; tmp.open_file(rgbPath.c_str()); tmp.unpack();
+    tmp.imgdata.params.no_auto_bright=1; tmp.imgdata.params.use_camera_wb=1; tmp.dcraw_process();
+    libraw_processed_image_t* pim = tmp.dcraw_make_mem_image();
+    int full_w = pim->width, full_h = pim->height;
+    LibRaw::dcraw_clear_mem(pim); tmp.recycle();
+
+    const double sx_full = 1.0/DOWNSCALE, sy_full = 1.0/DOWNSCALE;
+    Mat S1 = (Mat_<double>(3,3) << sx_full,0,0, 0,sy_full,0, 0,0,1);
+    Mat H_full = S1 * Hs * S1.inv();
+
+    // 3) Convert to RAW half-res grid (use LibRaw raw size)
+    LibRaw rraw; rraw.open_file(rgbPath.c_str()); rraw.unpack();
+    int raw_w = rraw.imgdata.sizes.raw_width;
+    int raw_h = rraw.imgdata.sizes.raw_height;
+    rraw.recycle();
+
+    const double sx_half = (raw_w/2.0) / double(full_w);
+    const double sy_half = (raw_h/2.0) / double(full_h);
+    Mat S2 = (Mat_<double>(3,3) << sx_half,0,0, 0,sy_half,0, 0,0,1);
+    H_half = S2 * H_full * S2.inv(); // final H in RAW half-res coordinates
     return true;
 }
 
-// Load/save cached H (full demosaiced resolution)
-static bool saveH(const Mat& H) {
-    FileStorage fs(H_PATH, FileStorage::WRITE);
-    if (!fs.isOpened()) return false;
-    fs << "H" << H;
-    return true;
+static bool saveH(const string& dir, const Mat& H_half) {
+    FileStorage fs(dir + "/H.yml", FileStorage::WRITE);
+    if (!fs.isOpened()) return false; fs << "H_half" << H_half; return true;
 }
-static bool loadH(Mat& H) {
-    FileStorage fs(H_PATH, FileStorage::READ);
-    if (!fs.isOpened()) return false;
-    fs["H"] >> H;
-    return !H.empty();
+static bool loadH(const string& dir, Mat& H_half) {
+    FileStorage fs(dir + "/H.yml", FileStorage::READ);
+    if (!fs.isOpened()) return false; fs["H_half"] >> H_half; return !H_half.empty();
 }
 
-// Compute NDVI
-static inline Mat computeNDVI(const Mat& nir, const Mat& red) {
-    Mat denom, numer, ndvi;
-    add(nir, red, denom);
-    subtract(nir, red, numer);
-    denom += EPS;
-    divide(numer, denom, ndvi);
-    ndvi.setTo(1.0f, ndvi > 1.0f);
-    ndvi.setTo(-1.0f, ndvi < -1.0f);
-    return ndvi;
-}
-
-// Save NDVI with fast PNG compression (or JPEG if preferred)
-static void saveNDVIColored(const Mat& ndvi, const string& ts) {
-    Mat ndvi_u8, colored;
-    ndvi.convertTo(ndvi_u8, CV_8UC1, 127.5, 127.5);
-    applyColorMap(ndvi_u8, colored, COLORMAP_JET);
-
-    vector<int> params = {IMWRITE_PNG_COMPRESSION, 1}; // faster than default(3)
-    imwrite("NDVI_" + ts + ".png", colored, params);
-}
-
-int main(int argc, char** argv) {
-    // if (argc < 4) {
-    //     cerr << "Usage:\n"
-    //          << "  " << argv[0] << " --calib <RGB.dng> <NOIR.dng>\n"
-    //          << "  " << argv[0] << " --run   <RGB.dng> <NOIR.dng>\n";
-    //     return 1;
-    // }
-    // static const string RGB_DNG = "/home/user/ws/ndvi_cal/20250812_181606_RGB.dng";   // set your path
-// static const string NOIR_DNG = "/home/user/ws/ndvi_cal/20250812_181606_NOIR.dng"; // set your path
-    string rgbPath = "/home/user/ws/ndvi_cal/20250812_190639_RGB.dng";
-    string noirPath = "/home/user/ws/ndvi_cal/20250812_190639_NOIR.dng";
-
-    // string mode = string("--calib");
-
-    // if (mode == string("--calib")) {
-    //     Mat H_full;
-    //     if (!estimateH(rgbPath, noirPath, H_full, 0.25)) {
-    //         cerr << "Homography estimation failed.\n";
-    //         return 2;
-    //     }
-    //     if (!saveH(H_full)) {
-    //         cerr << "Save H failed.\n";
-    //         return 3;
-    //     }
-    //     cout << "Saved H to " << H_PATH << endl;
-    //     // return 0;
-    // }
-    string mode = string("--run");
-
-    if (mode == string("--run")) {
-        Mat H_full;
-        if (!loadH(H_full)) {
-            cerr << "No cached H. Run --calib first.\n";
-            return 4;
+// ---------- NDVI ----------
+static inline void ndviParallel(const Mat& NIR, const Mat& RED, Mat& NDVI) {
+    NDVI.create(NIR.size(), CV_32FC1);
+#pragma omp parallel for schedule(static)
+    for (int y=0; y<NIR.rows; ++y) {
+        const float* pn = NIR.ptr<float>(y);
+        const float* pr = RED.ptr<float>(y);
+        float* pd = NDVI.ptr<float>(y);
+        for (int x=0; x<NIR.cols; ++x) {
+            const float n = pn[x], r = pr[x];
+            const float den = n + r;
+            float v = (den > 0.f) ? (n - r) / den : 0.f;
+            if (v > 1.0f) v = 1.0f; else if (v < -1.0f) v = -1.0f;
+            pd[x] = v;
         }
+    }
+}
 
-        // Scale H to RAW half-res grid
-        // Need sizes to compute scale factors: read small BGR once (fast)
-        Mat rgb_full_bgr = loadBGRforCorners(rgbPath, 1.0);
-        if (rgb_full_bgr.empty()) { cerr << "Failed to read RGB for sizing.\n"; return 5; }
+static Mat makeReverseJetLUT() {
+    // Build 0..255 ramp
+    Mat ramp(1, 256, CV_8UC1);
+    for (int i = 0; i < 256; ++i) ramp.at<uchar>(0, i) = static_cast<uchar>(i);
 
-        Mat red_raw  = loadRawChannel(rgbPath,  Channel::RED);
-        Mat nir_raw  = loadRawChannel(noirPath, Channel::NIR);
+    // Make JET LUT from ramp
+    Mat jet;
+    applyColorMap(ramp, jet, COLORMAP_JET); // jet: 1x256xCV_8UC3
 
-        double sx = double(red_raw.cols) / double(rgb_full_bgr.cols);
-        double sy = double(red_raw.rows) / double(rgb_full_bgr.rows);
-        Mat S  = (Mat_<double>(3,3) << sx,0,0, 0,sy,0, 0,0,1);
-        Mat S_inv = (Mat_<double>(3,3) << 1.0/sx,0,0, 0,1.0/sy,0, 0,0,1);
-        Mat H_half = S * H_full * S_inv;
+    // Reverse LUT (blue<->red)
+    Mat rjet;
+    flip(jet, rjet, 1); // flip horizontally
 
-        Mat nir_aligned;
-        warpPerspective(nir_raw, nir_aligned, H_half, red_raw.size(), INTER_LINEAR, BORDER_CONSTANT);
+    // Ensure shape is 256x1 as LUT expects
+    return rjet.reshape(3, 256); // 256x1xCV_8UC3
+}
 
-        Mat ndvi = computeNDVI(nir_aligned, red_raw);
-        string ts = extractTS(rgbPath);
-        saveNDVIColored(ndvi, ts);
-        cout << "Saved NDVI_" << ts << ".png\n";
-        return 0;
+static void saveColored(const Mat& ndvi, const string& outPNG) {
+    Mat u8, colored;
+    ndvi.convertTo(u8, CV_8UC1, 127.5, 127.5);
+
+    // Apply reversed JET
+    static Mat revLUT = makeReverseJetLUT();
+    applyColorMap(u8, colored, revLUT);
+
+    vector<int> p = {IMWRITE_PNG_COMPRESSION, 1}; // faster
+    imwrite(outPNG, colored, p);
+}
+
+// ---------- Modes ----------
+// static int mode_dark() {
+static int mode_dark(const string& rgb_dark, const string& nir_dark, const string& outDir) {
+    if (!ensureDir(outDir)) { cerr << "cannot create dir\n"; return 2; }
+    fs::copy_file("RGB_dark.dng", "./dark_red.dng", fs::copy_options::overwrite_existing);
+    fs::copy_file("NOIR_dark.dng", "./dark_nir.dng", fs::copy_options::overwrite_existing);
+    cout << "dark frames stored " << "\n";
+    return 0;
+}
+
+    // static int mode_white(double Rw) {
+    static int mode_white(const string& rgb_white, const string& nir_white, const string& outDir, double Rw) {
+    if (!ensureDir(outDir)) { cerr << "cannot create dir\n"; return 2; }
+
+    const string dr = "./dark_red.dng";
+    const string dn = "./dark_nir.dng";
+    if (!fs::exists(dr) || !fs::exists(dn)) { cerr << "dark frames not found\n"; return 3; }
+
+    RadCalib C; C.Rw = (Rw>0 && Rw<=1.0) ? Rw : 1.0;
+
+    C.B_red = loadRawRedLike(dr);
+    C.B_nir = loadRawRedLike(dn);
+    Mat W_red = loadRawRedLike(rgb_white);
+    Mat W_nir = loadRawRedLike(nir_white);
+    if (C.B_red.size()!=W_red.size() || C.B_nir.size()!=W_nir.size()) { cerr << "size mismatch\n"; return 4; }
+
+    C.ref_red = readShotMeta(rgb_white);
+    C.ref_nir = readShotMeta(nir_white);
+
+    subtract(W_red, C.B_red, C.WmB_red);
+    subtract(W_nir, C.B_nir, C.WmB_nir);
+
+    // Protect zeros only (optional threshold)
+    // Here we just ensure non-negative.
+    threshold(C.WmB_red, C.WmB_red, 0.f, 0.f, THRESH_TOZERO);
+    threshold(C.WmB_nir, C.WmB_nir, 0.f, 0.f, THRESH_TOZERO);
+
+    fs::copy_file(rgb_white, "./white_red.dng", fs::copy_options::overwrite_existing);
+    fs::copy_file(nir_white, "./white_nir.dng", fs::copy_options::overwrite_existing);
+
+    if (!saveRad(outDir, C)) { cerr << "save radiometric failed\n"; return 5; }
+    cout << "radiometric.yml saved in " << outDir << "\n";
+    return 0;
+}
+
+static int mode_calib(const string& rgb_chess, const string& nir_chess, const string& outDir) {
+    if (!ensureDir(outDir)) { cerr << "cannot create dir\n"; return 2; }
+    Mat Hh;
+    if (!estimateH_half(rgb_chess, nir_chess, Hh)) { cerr << "homography estimation failed\n"; return 3; }
+    if (!saveH(outDir, Hh)) { cerr << "save H failed\n"; return 4; }
+    cout << "H.yml (H_half) saved in " << outDir << "\n";
+    return 0;
+}
+
+static int mode_capture(const string& rgb_path, const string& nir_path, const string& dir, const string& outPNG_opt) {
+    RadCalib C;
+    if (!loadRad(dir, C)) { cerr << "load radiometric failed\n"; return 2; }
+    Mat H_half;
+    if (!loadH(dir, H_half)) { cerr << "load H failed\n"; return 3; }
+
+    // Load RAW planes (Red-like for RGB and NOIR+RedFilter)
+    Mat R_raw = loadRawRedLike(rgb_path);   // RGB camera Red channel
+    Mat M_raw = loadRawRedLike(nir_path);   // NOIR camera with Red filter (Red + NIR mix)
+    if (R_raw.size() != C.B_red.size() || M_raw.size() != C.B_nir.size()) { cerr << "size mismatch to calib\n"; return 4; }
+
+    // Dark subtract
+    Mat RmB, MmB;
+    subtract(R_raw, C.B_red, RmB);
+    subtract(M_raw, C.B_nir, MmB);
+
+    // Align NOIR+Red to RGB grid
+    Mat Mmb_aligned, WmB_nir_aligned;
+    warpPerspective(MmB,       Mmb_aligned,     H_half, RmB.size(), INTER_LINEAR, BORDER_REPLICATE);
+    warpPerspective(C.WmB_nir, WmB_nir_aligned, H_half, RmB.size(), INTER_LINEAR, BORDER_REPLICATE);
+
+    // Exposure normalization
+    const ShotMeta cur_red  = readShotMeta(rgb_path);
+    const ShotMeta cur_mixed = readShotMeta(nir_path);
+    const double s_red   = exposureScaleRobust(C.ref_red, cur_red);
+    const double s_mixed = exposureScaleRobust(C.ref_nir, cur_mixed);
+
+    // Convert to reflectance -> need to change
+    Mat R_reflect, M_reflect;
+    safeDivide(RmB,        C.WmB_red,       R_reflect);
+    safeDivide(Mmb_aligned,WmB_nir_aligned, M_reflect);
+    R_reflect *= (C.Rw * s_red);
+    M_reflect *= (C.Rw * s_mixed);
+
+    // Clamp negatives
+    threshold(R_reflect, R_reflect, 0.f, 0.f, THRESH_TOZERO);
+    threshold(M_reflect, M_reflect, 0.f, 0.f, THRESH_TOZERO);
+
+    // ---- New: Extract NIR from Mixed (Red + NIR) ----
+    // Coefficients from calibration (must be measured using white/grey/vegetation targets)
+    const double alpha = 0.65; // proportion of Red leakage into mixed
+    const double beta  = 1.00; // NIR scaling factor
+
+    Mat NIR_reflect;
+    NIR_reflect = (M_reflect - alpha * R_reflect) / (beta + 1e-6);
+    threshold(NIR_reflect, NIR_reflect, 0.f, 0.f, THRESH_TOZERO);
+
+    // NDVI
+    Mat NDVI;
+    ndviParallel(NIR_reflect, R_reflect, NDVI);
+
+    // Save
+    const string outPNG = outPNG_opt.empty() ? ("NDVI_" + tsFromName(rgb_path) + ".png") : outPNG_opt;
+    saveColored(NDVI, outPNG);
+    // Mat u8, colored;
+    // NDVI.convertTo(u8, CV_8UC1, 127.5, 127.5); // map [-1,1] to [0,255]
+    // applyColorMap(u8, colored, COLORMAP_JET);
+    // vector<int> p = {IMWRITE_PNG_COMPRESSION, 1};
+    // imwrite(outPNG, colored, p);
+    cout << "Saved " << outPNG << "\n";
+    return 0;
+}
+
+// ---------- Main ----------
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        cerr << "Usage:\n"
+             << "  " << argv[0] << " dark    <RGB_dark.dng> <NOIR_dark.dng>       <out_dir>\n"
+             << "  " << argv[0] << " white   <RGB_white.dng> <NOIR_white.dng>     <out_dir> <Rw>\n"
+             << "  " << argv[0] << " calib   <RGB_chess.dng> <NOIR_chess.dng>     <out_dir>\n"
+             << "  " << argv[0] << " capture <RGB.dng>      <NOIR.dng>            <dir_with_calib> [out.png]\n";
+        return 1;
     }
 
-    cerr << "Unknown mode.\n";
-    return 1;
-}
+    const string mode = argv[1];
 
+    if (mode == "dark") {
+        if (argc < 5) { cerr << "args\n"; return 1; }
+        return mode_dark(argv[2], argv[3], argv[4]);
+        // return mode_dark();
+    } else if (mode == "white") {
+        if (argc < 2) { cerr << "args\n"; return 1; }
+        const double Rw = atof(argv[2]);
+        // return mode_white(Rw);
+        return mode_white(argv[2], argv[3], argv[4], 1.0);
+    } else if (mode == "calib") {
+        if (argc < 5) { cerr << "args\n"; return 1; }
+        return mode_calib(argv[2], argv[3], argv[4]);
+    } else if (mode == "capture") {
+        if (argc < 5) { cerr << "args\n"; return 1; }
+        const string outPNG = (argc >= 6) ? argv[5] : "";
+        return mode_capture(argv[2], argv[3], argv[4], outPNG);
+    } else {
+        cerr << "unknown mode\n";
+        return 1;
+    }
+}
